@@ -1,0 +1,34 @@
+[package]
+name = "check-pool-health"
+version = "0.1.2"
+edition = "2021"
+
+[dependencies]
+serde_json = { version = "1.0.64", default-features = false, features = ["alloc"] }
+tokio-util = { version = "*", features = ["codec"] }
+lazy_static = "1.4.0"
+rand = "0.8.4"
+tokio = {version="^1.36.0",features = ["full","tracing"]}
+key-utils = "1.0.0"
+clap={version = "4.5.31", features = ["derive"]}
+
+demand-share-accounting-ext = { git = "https://github.com/demand-open-source/share-accounting-ext"}
+demand-sv2-connection = {git = "https://github.com/demand-open-source/demand-sv2-connection"}
+roles_logic_sv2 = { git = "https://github.com/demand-open-source/stratum", branch ="ImproveCoinbase", subdirectory = "protocols/v2/roles-logic-sv2"}
+framing_sv2 = { git = "https://github.com/demand-open-source/stratum", branch = "ImproveCoinbase",subdirectory = "protocols/v2/framing_sv2" }
+binary_sv2 = { git = "https://github.com/demand-open-source/stratum", branch ="ImproveCoinbase",subdirectory = "protocols/v2/binary_sv2"}
+noise_sv2 = { git = "https://github.com/demand-open-source/stratum", branch="ImproveCoinbase",subdirectory = "protocols/v2/noise-sv2"}
+codec_sv2 = { git = "https://github.com/demand-open-source/stratum", branch="ImproveCoinbase",subdirectory = "protocols/v2/codec-sv2", features = ["noise_sv2","with_buffer_pool"]}
+sv1_api = { git = "https://github.com/demand-open-source/stratum", branch = "ImproveCoinbase",subdirectory = "protocols/v1"}
+
+[dev-dependencies]
+rand = "0.8.5"
+sha2 = "0.10.8"
+
+[profile.release]
+strip = true
+lto = true
+panic = 'abort'
+
+[profile.dev]
+panic = 'abort'
