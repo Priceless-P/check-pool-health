@@ -24,4 +24,4 @@ If all expected messages are received, the script prints:
 Pool is healthy
 ```
 
-Otherwise, it returns the list of missing messages and exits with a non-zero status code.
+Otherwise, it returns the list of missing messages and exits.
