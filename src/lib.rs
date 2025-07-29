@@ -1,34 +1,33 @@
-use std::{
-    collections::HashSet,
-    net::{SocketAddr, ToSocketAddrs},
-    time::Duration,
-};
-mod errors;
+pub mod errors;
 mod jd_connection;
 mod mining_pool_connection;
 mod utils;
+
+use crate::jd_connection::SetupConnectionHandler;
+use crate::mining_pool_connection::{
+    initialize_mining_connections, mining_setup_connection, open_channel, relay_down, relay_up,
+};
+use crate::utils::AbortOnDrop;
 use binary_sv2::{Seq064K, Sv2DataType, B0255, B064K};
-use clap::Parser;
 use codec_sv2::{Frame, HandshakeRole, StandardEitherFrame, StandardSv2Frame};
 use demand_share_accounting_ext::parser::PoolExtMessages;
 use demand_sv2_connection::noise_connection_tokio::Connection;
-use jd_connection::SetupConnectionHandler;
 use key_utils::Secp256k1PublicKey;
-use lazy_static::lazy_static;
-use mining_pool_connection::{
-    initialize_mining_connections, mining_setup_connection, open_channel, relay_down, relay_up,
-};
 use noise_sv2::Initiator;
 use roles_logic_sv2::{
     job_declaration_sv2::{AllocateMiningJobToken, DeclareMiningJob},
     parsers::{JobDeclaration, Mining, PoolMessages},
+};
+use std::{
+    collections::HashSet,
+    net::{SocketAddr, ToSocketAddrs},
+    time::Duration,
 };
 use tokio::{
     net::TcpStream,
     sync::mpsc::{channel, Receiver, Sender},
     time::{sleep, Instant},
 };
-use utils::AbortOnDrop;
 
 pub type Message = PoolExtMessages<'static>;
 pub type Msg = PoolMessages<'static>;
@@ -38,11 +37,7 @@ pub type EitherFrame = StandardEitherFrame<Message>;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-lazy_static! {
-    static ref ARGS: Args = Args::parse();
-    pub static ref POOL_ADDRESS: &'static str = &ARGS.pool_address;
-    pub static ref AUTH_PUB_KEY: &'static str = &ARGS.auth_key;
-}
+const AUTH_PUB_KEY: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 
 // List of messages we expect to receive to confirm the pool is healthy
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -55,22 +50,62 @@ enum ExpectedMessage {
     DeclareMiningJobSuccess,
 }
 
-#[derive(Parser)]
-struct Args {
-    #[clap(long = "pool", short = 'p')]
-    pool_address: String,
-    #[clap(
-        long = "pubkey",
-        short = 'k',
-        default_value = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
-    )]
-    auth_key: String,
+/// Checks if the pool is healthy by establishing a connection and verifying the expected messages are received.
+///
+/// ### Args
+/// - `pool`: The address of the pool.
+/// - `token`: The token of the user.
+/// - `auth_key`: Optional AUTH_PUB_KEY for the connection.
+///   If `auth_key` is not provided, the default AUTH_PUB_KEY is used.
+///
+/// ### Returns
+/// Prints the status of the pool connection and returns an error if the expected messages are not received within the timeout period.
+pub async fn check(pool: String, token: String, auth_key: Option<String>) -> Result<(), String> {
+    // Create a channel for to ExpectedMessage
+    let (msg_tx, msg_rx) = channel::<ExpectedMessage>(10);
+    let pool: SocketAddr = match pool.to_socket_addrs() {
+        Ok(mut addr) => addr.next().expect("Could not resolve pool address"),
+        Err(_) => return Err("Invalid pool address".into()),
+    };
+    let default_auth_key: Secp256k1PublicKey = AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let auth_key = match auth_key {
+        Some(key) => key.parse().map_err(|_| "Invalid auth key".to_string())?,
+        None => default_auth_key,
+    };
+
+    // Set up a connection to the pool
+    let (send_from_down, recv_from_down, relay_up_task, relay_down_task) =
+        setup_mining_connection(pool, auth_key, msg_tx.clone(), token.clone()).await;
+
+    if send_from_down
+        .send(PoolExtMessages::Mining(open_channel()))
+        .await
+        .is_err()
+    {
+        return Err("Failed to send OpenExtendedMiningChannel".into());
+    }
+
+    // Set up a connection for jd
+    let (jd_sender, jd_receiver) = setup_jd_connection(pool, auth_key, token).await;
+
+    let pool_messages = tokio::spawn(handle_pool_messages(recv_from_down, msg_tx.clone()));
+    let jd_messages = tokio::spawn(handle_jd_messages(jd_receiver, jd_sender.clone(), msg_tx));
+
+    let result = await_messages(msg_rx).await;
+
+    pool_messages.abort();
+    jd_messages.abort();
+    drop(relay_up_task);
+    drop(relay_down_task);
+
+    result
 }
 
 async fn setup_mining_connection(
     pool: SocketAddr,
     auth_key: Secp256k1PublicKey,
     msg_tx: Sender<ExpectedMessage>,
+    token: String,
 ) -> (
     Sender<PoolExtMessages<'static>>,
     Receiver<PoolExtMessages<'static>>,
@@ -81,7 +116,7 @@ async fn setup_mining_connection(
     let stream = TcpStream::connect(pool).await.expect("Connection failed");
 
     let (mut receiver, mut sender, setup_msg) =
-        initialize_mining_connections(None, stream, auth_key)
+        initialize_mining_connections(None, stream, auth_key, token)
             .await
             .expect("Failed to init mining conn");
 
@@ -121,6 +156,7 @@ async fn setup_mining_connection(
 async fn setup_jd_connection(
     pool: SocketAddr,
     auth_key: Secp256k1PublicKey,
+    token: String,
 ) -> (
     Sender<Frame<PoolMessages<'static>, codec_sv2::buffer_sv2::Slice>>,
     Receiver<Frame<PoolMessages<'static>, codec_sv2::buffer_sv2::Slice>>,
@@ -136,7 +172,7 @@ async fn setup_jd_connection(
             .await
             .expect("Noise connection failed");
 
-    SetupConnectionHandler::setup(&mut jd_receiver, &mut jd_sender, pool)
+    SetupConnectionHandler::setup(&mut jd_receiver, &mut jd_sender, pool, token)
         .await
         .expect("JD setup failed");
 
@@ -158,41 +194,6 @@ async fn setup_jd_connection(
         .expect("Failed to send allocate token msg");
 
     (jd_sender, jd_receiver)
-}
-
-pub async fn check_pool_health(
-    pool: SocketAddr,
-    auth_key: Secp256k1PublicKey,
-) -> Result<(), String> {
-    // Create a channel for to ExpectedMessage
-    let (msg_tx, msg_rx) = channel::<ExpectedMessage>(10);
-
-    // Set up a connection to the pool
-    let (send_from_down, recv_from_down, relay_up_task, relay_down_task) =
-        setup_mining_connection(pool, auth_key, msg_tx.clone()).await;
-
-    if send_from_down
-        .send(PoolExtMessages::Mining(open_channel()))
-        .await
-        .is_err()
-    {
-        return Err("Failed to send OpenExtendedMiningChannel".into());
-    }
-
-    // Set up a connection for jd
-    let (jd_sender, jd_receiver) = setup_jd_connection(pool, auth_key).await;
-
-    let pool_messages = tokio::spawn(handle_pool_messages(recv_from_down, msg_tx.clone()));
-    let jd_messages = tokio::spawn(handle_jd_messages(jd_receiver, jd_sender.clone(), msg_tx));
-
-    let result = await_messages(msg_rx).await;
-
-    pool_messages.abort();
-    jd_messages.abort();
-    drop(relay_up_task);
-    drop(relay_down_task);
-
-    result
 }
 
 async fn await_messages(mut msg_rx: Receiver<ExpectedMessage>) -> Result<(), String> {
@@ -316,27 +317,5 @@ async fn send_declare_jobs(
 
     if let Err(e) = sender.send(frame.into()).await {
         println!("Failed to send DeclareMiningJob: {}", e);
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    let args = Args::parse();
-
-    let pool = args
-        .pool_address
-        .to_socket_addrs()
-        .expect("Invalid pool address")
-        .next()
-        .expect("Could not resolve pool address");
-
-    let auth_key: Secp256k1PublicKey = args.auth_key.parse().expect("Invalid public key");
-
-    match check_pool_health(pool, auth_key).await {
-        Ok(()) => println!("Pool is healthy"),
-        Err(e) => {
-            eprintln!("Health check failed: {}", e);
-            std::process::exit(1);
-        }
     }
 }

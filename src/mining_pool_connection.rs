@@ -55,7 +55,10 @@ pub async fn mining_setup_connection(
     }
 }
 
-pub fn get_mining_setup_connection_msg(work_selection: bool) -> SetupConnection<'static> {
+pub fn get_mining_setup_connection_msg(
+    work_selection: bool,
+    token: String,
+) -> SetupConnection<'static> {
     let endpoint_host = "0.0.0.0"
         .to_string()
         .into_bytes()
@@ -75,7 +78,6 @@ pub fn get_mining_setup_connection_msg(work_selection: bool) -> SetupConnection<
     } else {
         0b0000_0000_0000_0000_0000_0000_0000_0100
     };
-    let token = std::env::var("TOKEN").expect("TOKEN environment variable not set");
     let device_id = rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
     let device_id = format!("{}::POOLED::{}", device_id, token)
         .try_into()
@@ -169,6 +171,7 @@ pub async fn initialize_mining_connections(
     setup_connection_msg: Option<SetupConnection<'static>>,
     stream: TcpStream,
     authority_public_key: Secp256k1PublicKey,
+    token: String,
 ) -> Result<
     (
         Receiver<codec_sv2::Frame<PoolExtMessages<'static>, Slice>>,
@@ -188,6 +191,6 @@ pub async fn initialize_mining_connections(
             }
         };
     let setup_connection_msg =
-        setup_connection_msg.unwrap_or_else(|| get_mining_setup_connection_msg(true));
+        setup_connection_msg.unwrap_or_else(|| get_mining_setup_connection_msg(true, token));
     Ok((receiver, sender, setup_connection_msg))
 }
